@@ -1,0 +1,32 @@
+name: Обновление данных из открытых источников Тольятти
+
+on:
+  schedule:
+    # Каждые 2 дня в 06:00 и 15:00 по Самарскому времени (SAMT = UTC+4)
+    # UTC: 02:00 и 11:00
+    - cron: "0 2,11 */2 * *"
+  workflow_dispatch:
+
+jobs:
+  parse-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Проверка репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 gspread google-auth
+
+      - name: Запуск парсера
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python parser.py
