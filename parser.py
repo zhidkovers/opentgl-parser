@@ -112,7 +112,7 @@ def parse_csv_links_from_page(page_number: int) -> list[dict]:
     return results
 
 
-def parse_csv_with_pandas(url: str) -> list[list[str]] | None:
+def parse_csv_with_pandas(url: str) -> pd.DataFrame | None:
     """
     Скачивает и парсит CSV-файл через pandas.
 
@@ -123,9 +123,7 @@ def parse_csv_with_pandas(url: str) -> list[list[str]] | None:
     Перебирает популярные кодировки: UTF-8, CP1251, KOI8-R.
     Все значения NaN/null заменяются на пустую строку.
 
-    Возвращает список списков:
-      - первая строка — заголовки столбцов
-      - остальные строки — данные
+    Возвращает DataFrame или None при ошибке.
     """
     encodings_to_try = ["utf-8", "cp1251", "koi8-r"]
     last_error = None
@@ -144,20 +142,14 @@ def parse_csv_with_pandas(url: str) -> list[list[str]] | None:
                 on_bad_lines="warn",
             )
 
-            # Замена любых оставшихся NaN/None на пустую строку
             df = df.fillna("")
 
-            # Датафрейм → список списков (первая строка — заголовки)
-            headers = df.columns.tolist()
-            data_rows = df.values.tolist()
-            result = [headers] + data_rows
+            print(f"    Успешно: {len(df)} строк, {len(df.columns)} колонок")
+            print(f"    Заголовки: {df.columns.tolist()}")
+            if len(df) > 0:
+                print(f"    Образец первой строки данных: {df.iloc[0].tolist()}")
 
-            print(f"    Успешно: {len(result)} строк, {len(headers)} колонок")
-            print(f"    Заголовки: {headers}")
-            if len(data_rows) > 0:
-                print(f"    Образец первой строки данных: {data_rows[0]}")
-
-            return result
+            return df
 
         except Exception as e:
             last_error = e
@@ -170,6 +162,30 @@ def parse_csv_with_pandas(url: str) -> list[list[str]] | None:
         file=sys.stderr,
     )
     return None
+
+
+def dataframe_to_sheet_data(df: pd.DataFrame) -> list[list[str]]:
+    """
+    Преобразует DataFrame в список списков для Google Sheets.
+    Первая строка — заголовки столбцов, остальные — данные.
+    """
+    headers = df.columns.tolist()
+    data = df.values.tolist()
+    return [headers] + data
+
+
+def save_json(df: pd.DataFrame, filename: str):
+    """
+    Сохраняет DataFrame в JSON-файл (массив объектов).
+    Формат: [{"колонка": "значение", ...}, ...]
+    Файл создаётся в директории data/.
+    """
+    records = df.to_dict(orient="records")
+    os.makedirs("data", exist_ok=True)
+    path = os.path.join("data", f"{filename}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=4)
+    print(f"    JSON сохранён: {path} ({len(records)} записей)")
 
 
 def get_google_sheet(spreadsheet_id: str, credentials_json: str):
@@ -272,7 +288,7 @@ def main():
 
     # Шаг 3: обработка каждого CSV-файла
     print(f"\n{'=' * 60}")
-    print("ЭТАП 3: Скачивание и загрузка CSV в Google Sheets")
+    print("ЭТАП 3: Скачивание, конвертация в JSON и загрузка в Google Sheets")
     print("=" * 60)
     processed = 0
     skipped = 0
@@ -282,11 +298,17 @@ def main():
 
         print(f"\n--- {filename} ---")
 
-        data = parse_csv_with_pandas(url)
-        if data is None:
+        df = parse_csv_with_pandas(url)
+        if df is None:
             print(f"  ПРОПУСК {filename}: не удалось прочитать CSV")
             skipped += 1
             continue
+
+        # Сохранение в JSON (массив объектов)
+        save_json(df, filename)
+
+        # Конвертация в список списков для Google Sheets
+        sheet_data = dataframe_to_sheet_data(df)
 
         # Создаём новый лист или получаем существующий
         try:
@@ -296,7 +318,7 @@ def main():
             worksheet = sheet.add_worksheet(title=filename, rows=1, cols=1)
             print(f"  Создан новый лист '{filename}'")
 
-        update_sheet(worksheet, data)
+        update_sheet(worksheet, sheet_data)
         processed += 1
         print(f"  +++ Лист '{filename}' успешно обновлён +++")
 
