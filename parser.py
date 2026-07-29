@@ -149,11 +149,11 @@ def _detect_delimiter(text: str) -> str:
     """
     lines = text.strip().splitlines()
     if not lines:
-        print("    Текст пуст, разделитель по умолчанию: ','")
-        return ","
+        print("    Текст пуст, разделитель по умолчанию: ';'")
+        return ";"
 
     delimiters = [";", ",", "\t", "|"]
-    best_delim = ","
+    best_delim = ";"
     best_score = -1
 
     for delim in delimiters:
