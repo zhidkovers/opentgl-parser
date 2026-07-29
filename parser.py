@@ -4,17 +4,17 @@
 """
 Парсер открытых данных г. Тольятти (https://tgl.ru/opendata/setlist/).
 
-Скрипт собирает со страниц 1-3 ссылки на CSV-файлы, скачивает их содержимое
-и загружает данные в Google Таблицу. Каждому CSV соответствует отдельный лист.
+Скрипт собирает со страниц 1-3 ссылки на CSV-файлы, скачивает и парсит их
+с помощью pandas (автоопределение разделителя и кодировки), затем загружает
+данные в Google Таблицу. Каждому CSV соответствует отдельный лист.
 """
 
 import os
 import sys
 import json
-import csv
-import io
 
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
@@ -27,6 +27,10 @@ BASE_URL = "https://tgl.ru"
 SETLIST_URL = urljoin(BASE_URL, "/opendata/setlist/")
 TOTAL_PAGES = 3
 REQUEST_TIMEOUT = 30
+
+# Пороговые значения для валидации данных
+MIN_ROWS_FOR_VALID_CSV = 1
+MIN_COLS_FOR_VALID_CSV = 1
 
 
 def parse_csv_links_from_page(page_number: int) -> list[dict]:
@@ -41,8 +45,10 @@ def parse_csv_links_from_page(page_number: int) -> list[dict]:
         response = requests.get(url, timeout=REQUEST_TIMEOUT)
         response.encoding = "utf-8"
         response.raise_for_status()
-        print(f"  Страница загружена, размер: {len(response.text)} байт, "
-              f"статус: {response.status_code}")
+        print(
+            f"  Страница загружена, размер: {len(response.text)} байт, "
+            f"статус: {response.status_code}"
+        )
     except requests.RequestException as e:
         print(f"  ОШИБКА при загрузке страницы {url}: {e}", file=sys.stderr)
         return []
@@ -106,108 +112,64 @@ def parse_csv_links_from_page(page_number: int) -> list[dict]:
     return results
 
 
-def download_csv(url: str) -> str | None:
+def parse_csv_with_pandas(url: str) -> list[list[str]] | None:
     """
-    Скачивает CSV-файл по указанному URL.
-    Возвращает содержимое в виде строки или None при ошибке.
-    Пытается декодировать как UTF-8, затем как CP1251.
+    Скачивает и парсит CSV-файл через pandas.
+
+    Параметры:
+      sep=None — pandas автоматически определяет разделитель (; , и др.)
+      engine='python' — требуется для работы sep=None
+
+    Перебирает популярные кодировки: UTF-8, CP1251, KOI8-R.
+    Все значения NaN/null заменяются на пустую строку.
+
+    Возвращает список списков:
+      - первая строка — заголовки столбцов
+      - остальные строки — данные
     """
-    print(f"    Скачивание: {url}")
-    try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        print(f"    Скачан, размер: {len(response.content)} байт, "
-              f"статус: {response.status_code}, "
-              f"content-type: {response.headers.get('Content-Type', 'не указан')}")
-    except requests.RequestException as e:
-        print(f"    ОШИБКА при скачивании {url}: {e}", file=sys.stderr)
-        return None
+    encodings_to_try = ["utf-8", "cp1251", "koi8-r"]
+    last_error = None
 
-    content = response.content
-
-    # Пробуем наиболее вероятные кодировки для российских сайтов
-    for encoding in ("utf-8", "cp1251", "koi8-r"):
+    for encoding in encodings_to_try:
         try:
-            decoded = content.decode(encoding)
-            print(f"    Кодировка: {encoding}")
-            return decoded
-        except (UnicodeDecodeError, UnicodeError):
-            print(f"    Кодировка {encoding} не подошла, пробую дальше...")
+            print(f"    Попытка чтения: encoding={encoding}, sep=auto")
 
-    # Если ничего не подошло — декодируем с заменой нечитаемых символов
-    print(f"    Кодировка не определена, декодирую utf-8 с заменой ошибок")
-    return content.decode("utf-8", errors="replace")
+            df = pd.read_csv(
+                url,
+                sep=None,
+                engine="python",
+                encoding=encoding,
+                keep_default_na=False,
+                dtype=str,
+                on_bad_lines="warn",
+            )
 
+            # Замена любых оставшихся NaN/None на пустую строку
+            df = df.fillna("")
 
-def _detect_delimiter(text: str) -> str:
-    """
-    Определяет наиболее вероятный разделитель CSV.
-    Приоритет: ';' -> ',' -> '\t' -> '|'.
-    Для каждого разделителя парсит текст и оценивает:
-      - среднее количество полей на строку (без учёта пустых строк)
-      - количество строк, где число полей совпадает с максимальным
-    """
-    lines = text.strip().splitlines()
-    if not lines:
-        print("    Текст пуст, разделитель по умолчанию: ';'")
-        return ";"
+            # Датафрейм → список списков (первая строка — заголовки)
+            headers = df.columns.tolist()
+            data_rows = df.values.tolist()
+            result = [headers] + data_rows
 
-    delimiters = [";", ",", "\t", "|"]
-    best_delim = ";"
-    best_score = -1
+            print(f"    Успешно: {len(result)} строк, {len(headers)} колонок")
+            print(f"    Заголовки: {headers}")
+            if len(data_rows) > 0:
+                print(f"    Образец первой строки данных: {data_rows[0]}")
 
-    for delim in delimiters:
-        total_cols = 0
-        non_empty = 0
-        for line in lines:
-            if not line.strip():
-                continue
-            reader = csv.reader(io.StringIO(line), delimiter=delim)
-            try:
-                row = next(reader)
-                total_cols += len(row)
-                non_empty += 1
-            except StopIteration:
-                continue
+            return result
 
-        if non_empty == 0:
-            print(f"    Разделитель '{delim}': нет непустых строк — пропущен")
+        except Exception as e:
+            last_error = e
+            print(f"    Кодировка {encoding} не подошла: {e}")
             continue
 
-        avg_cols = total_cols / non_empty
-        consistent = sum(
-            1 for line in lines
-            if line.strip()
-            and len(next(csv.reader(io.StringIO(line), delimiter=delim))) >= avg_cols
-        )
-
-        score = avg_cols * consistent
-        print(f"    Разделитель '{delim}': ср. колонок={avg_cols:.2f}, "
-              f"согласовано={consistent}, оценка={score:.2f}")
-
-        if score > best_score:
-            best_score = score
-            best_delim = delim
-
-    print(f"    Выбран разделитель: '{best_delim}' (оценка {best_score:.2f})")
-    return best_delim
-
-
-def parse_csv_content(text: str) -> list[list[str]]:
-    """
-    Принимает строку с CSV-данными и возвращает список строк,
-    каждая из которых — список значений ячеек.
-    Разделитель определяется автоматически с приоритетом ';'.
-    """
-    delimiter = _detect_delimiter(text)
-    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
-    rows = [row for row in reader]
-    col_count = len(rows[0]) if rows else 0
-    print(f"    Распарсено строк: {len(rows)}, колонок: {col_count}")
-    if len(rows) > 1:
-        print(f"    Первая строка (заголовок): {rows[0]}")
-        print(f"    Вторая строка (образец):   {rows[1]}")
-    return rows
+    print(
+        f"    ОШИБКА: CSV не читается ни в одной кодировке. "
+        f"Последняя ошибка: {last_error}",
+        file=sys.stderr,
+    )
+    return None
 
 
 def get_google_sheet(spreadsheet_id: str, credentials_json: str):
@@ -239,9 +201,12 @@ def update_sheet(worksheet, data: list[list[str]]):
 
     rows = len(data)
     cols = len(data[0]) if data else 0
-    print(f"    Запись {rows} строк x {cols} колонок в лист '{worksheet.title}'...")
+    print(
+        f"    Запись {rows} строк x {cols} колонок "
+        f"в лист '{worksheet.title}'..."
+    )
 
-    # Пакетная запись: преобразуем список строк в список списков
+    # Пакетная запись: за один вызов отправляем все данные
     worksheet.update(values=data, range_name="A1")
     print(f"    Запись завершена")
 
@@ -251,7 +216,8 @@ def main():
     Основной рабочий процесс:
       1. Сбор CSV-ссылок со страниц 1-3.
       2. Подключение к Google Таблице.
-      3. Скачивание каждого CSV и запись в соответствующий лист.
+      3. Скачивание и парсинг каждого CSV через pandas,
+         затем запись в соответствующий лист.
     """
 
     # Чтение переменных окружения
@@ -295,7 +261,7 @@ def main():
     print("ЭТАП 2: Подключение к Google Sheets")
     print("=" * 60)
     print(f"ID таблицы: {spreadsheet_id}")
-    print(f"Сервисный аккаунт: загружен из GOOGLE_SERVICE_ACCOUNT_JSON")
+    print("Сервисный аккаунт: загружен из GOOGLE_SERVICE_ACCOUNT_JSON")
     try:
         sheet = get_google_sheet(spreadsheet_id, credentials_json)
         print(f"Подключение успешно: таблица '{sheet.title}'")
@@ -316,13 +282,11 @@ def main():
 
         print(f"\n--- {filename} ---")
 
-        csv_text = download_csv(url)
-        if csv_text is None:
-            print(f"  ПРОПУСК {filename}: не удалось скачать")
+        data = parse_csv_with_pandas(url)
+        if data is None:
+            print(f"  ПРОПУСК {filename}: не удалось прочитать CSV")
             skipped += 1
             continue
-
-        data = parse_csv_content(csv_text)
 
         # Создаём новый лист или получаем существующий
         try:
