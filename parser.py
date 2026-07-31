@@ -12,11 +12,17 @@
 import os
 import sys
 import json
+import io
 
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+
+# Загрузка креденшелов из .env
+# from dotenv import load_dotenv
+
+# load_dotenv()
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -27,6 +33,7 @@ BASE_URL = "https://tgl.ru"
 SETLIST_URL = urljoin(BASE_URL, "/opendata/setlist/")
 TOTAL_PAGES = 3
 REQUEST_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 10  # таймаут скачивания данных, секунд
 
 # Пороговые значения для валидации данных
 MIN_ROWS_FOR_VALID_CSV = 1
@@ -112,29 +119,120 @@ def parse_csv_links_from_page(page_number: int) -> list[dict]:
     return results
 
 
+def _decode_sniff(raw: bytes) -> str:
+    """
+    Декодирует байты в подходящей кодировке для анализа первых строк.
+    Возвращает текст, даже если идеальной кодировки нет (с заменой ошибок).
+    """
+    for encoding in ("utf-8", "cp1251"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _detect_delimiter(raw: bytes) -> str | None:
+    """
+    Определяет разделитель CSV на основе первых строк файла.
+
+    Приоритеты:
+      1. Если первая строка содержит слово «маршрут» (в любом регистре и
+         любом числе: маршрут, маршрута, маршруты) — это транспортные
+         данные, у которых разделитель ВСЕГДА ';'.
+      2. Иначе — эвристика по количеству символов в первой непустой строке:
+         если ';' больше или равно ',' — берём ';', иначе ','.
+      3. Если разделитель не удалось определить — возвращаем None
+         (pandas попробует автоматически).
+    """
+    text = _decode_sniff(raw)
+
+    first_line = None
+    for line in text.splitlines():
+        if line.strip():
+            first_line = line
+            break
+
+    if first_line is None:
+        return None
+
+    # Транспортные данные: слово «маршрут» в первой строке -> всегда ';'
+    if "маршрут" in first_line.lower():
+        print(
+            f"    Обнаружены транспортные данные (первая строка содержит "
+            f"'маршрут') -> разделитель принудительно ';'"
+        )
+        return ";"
+
+    # Эвристика: сравниваем количество разделителей в первой строке
+    semicolons = first_line.count(";")
+    commas = first_line.count(",")
+
+    if semicolons > 0 and semicolons >= commas:
+        print(f"    Эвристика: ';'={semicolons}, ','={commas} -> разделитель ';'")
+        return ";"
+    if commas > 0:
+        print(f"    Эвристика: ';'={semicolons}, ','={commas} -> разделитель ','")
+        return ","
+
+    print(f"    Эвристика: разделитель не определён, оставляю автоопределение")
+    return None
+
+
 def parse_csv_with_pandas(url: str) -> pd.DataFrame | None:
     """
     Скачивает и парсит CSV-файл через pandas.
 
     Параметры:
-      sep=None — pandas автоматически определяет разделитель (; , и др.)
-      engine='python' — требуется для работы sep=None
+      url — ссылка на файл данных (CSV/JSON на сайте)
+      таймаут скачивания — DOWNLOAD_TIMEOUT (10 секунд)
 
-    Перебирает популярные кодировки: UTF-8, CP1251, KOI8-R.
-    Все значения NaN/null заменяются на пустую строку.
+    Сначала файл скачивается через requests (с таймаутом 10 секунд),
+    затем передаётся в pandas, который автоматически определяет
+    разделитель (sep=None, engine='python') и кодировку.
+
+    Исключение: транспортные данные (первая строка содержит «Маршруты»)
+    всегда читаются с принудительным разделителем ';'.
 
     Возвращает DataFrame или None при ошибке.
     """
+    print(f"    Скачивание данных: {url}")
+    try:
+        response = requests.get(url, timeout=DOWNLOAD_TIMEOUT)
+        response.raise_for_status()
+        print(
+            f"    Скачано, размер: {len(response.content)} байт, "
+            f"статус: {response.status_code}"
+        )
+    except requests.Timeout:
+        print(
+            f"    ОШИБКА: таймаут {DOWNLOAD_TIMEOUT} сек при скачивании {url}",
+            file=sys.stderr,
+        )
+        return None
+    except requests.RequestException as e:
+        print(f"    ОШИБКА при скачивании {url}: {e}", file=sys.stderr)
+        return None
+
+    raw = response.content
+
+    # Определяем разделитель (для транспортных данных — всегда ';')
+    delimiter = _detect_delimiter(raw)
+
+    content = io.BytesIO(raw)
     encodings_to_try = ["utf-8", "cp1251", "koi8-r"]
     last_error = None
 
     for encoding in encodings_to_try:
         try:
-            print(f"    Попытка чтения: encoding={encoding}, sep=auto")
+            sep_desc = repr(delimiter) if delimiter else "auto"
+            print(f"    Попытка чтения: encoding={encoding}, sep={sep_desc}")
+
+            content.seek(0)  # сброс указателя перед повторным чтением
 
             df = pd.read_csv(
-                url,
-                sep=None,
+                content,
+                sep=delimiter,  # None — pandas определит сам
                 engine="python",
                 encoding=encoding,
                 keep_default_na=False,
